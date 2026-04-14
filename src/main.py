@@ -17,7 +17,11 @@ from src.index_builder import build_index
 from src.instrumentation.logging import get_logger
 from src.ranking.ranker import EnsembleRanker
 from src.preprocessing.chunking import DocumentChunker
-from src.query_enhancement import generate_hypothetical_document, contextualize_query
+from src.query_enhancement import (
+    generate_hypothetical_document,
+    contextualize_query,
+    decompose_complex_query,
+)
 from src.retriever import (
     filter_retrieved_chunks, 
     BM25Retriever, 
@@ -96,6 +100,117 @@ def use_indexed_chunks(question: str, chunks: list) -> list:
     }
     return [chunks[cid] for cid in chunk_ids], list(chunk_ids)
 
+
+def build_retrieval_queries(question: str, cfg: RAGConfig) -> list[str]:
+    """Build the list of queries we will retrieve on."""
+    queries = [question]
+
+    if not cfg.use_query_decomposition:
+        return queries
+
+    try:
+        sub_questions = decompose_complex_query(
+            question,
+            cfg.gen_model,
+            max_sub_questions=cfg.max_sub_questions,
+        )
+    except Exception as e:
+        print(f"Warning: Failed to decompose query: {e}. Using original query.")
+        return queries
+
+    seen = {question.strip().lower()}
+    for sub_question in sub_questions:
+        cleaned = sub_question.strip()
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if lowered in seen:
+            continue
+        queries.append(cleaned)
+        seen.add(lowered)
+        if len(queries) >= cfg.max_sub_questions + 1:
+            break
+
+    return queries
+
+
+def build_sub_query_ranker(cfg: RAGConfig, retrievers: list, default_ranker: Any) -> Any:
+    """Use a small FAISS + BM25 mix for sub-questions if BM25 is off."""
+    if cfg.ranker_weights.get("bm25", 0) > 0:
+        return default_ranker
+
+    retriever_names = {retriever.name for retriever in retrievers}
+    if "faiss" not in retriever_names or "bm25" not in retriever_names:
+        return default_ranker
+
+    sub_query_weights = {
+        "faiss": 0.5,
+        "bm25": 0.5,
+        "index_keywords": 0.0,
+    }
+    return EnsembleRanker(
+        ensemble_method=cfg.ensemble_method,
+        weights=sub_query_weights,
+        rrf_k=int(cfg.rrf_k),
+    )
+
+
+def retrieve_chunks_for_query(
+    query: str,
+    cfg: RAGConfig,
+    retrievers: list,
+    ranker: Any,
+    chunks: list
+) -> tuple[list[int], list[float], Dict[str, Dict[int, float]], str]:
+    """Run retrieval once for one query."""
+    retrieval_query = query
+    if cfg.use_hyde:
+        retrieval_query = generate_hypothetical_document(
+            query,
+            cfg.gen_model,
+            max_tokens=cfg.hyde_max_tokens,
+        )
+
+    pool_n = max(cfg.num_candidates, cfg.top_k + 10)
+    raw_scores: Dict[str, Dict[int, float]] = {}
+    for retriever in retrievers:
+        raw_scores[retriever.name] = retriever.get_scores(retrieval_query, pool_n, chunks)
+
+    ordered, scores = ranker.rank(raw_scores=raw_scores)
+    topk_idxs = filter_retrieved_chunks(cfg, chunks, ordered)
+    return topk_idxs, scores, raw_scores, retrieval_query
+
+
+def merge_chunk_lists(chunk_lists: list[list[int]], limit: int) -> list[int]:
+    """Round-robin merge so one query does not fill every slot."""
+    merged = []
+    seen = set()
+    positions = [0] * len(chunk_lists)
+
+    while len(merged) < limit:
+        added_any = False
+
+        for list_idx, chunk_list in enumerate(chunk_lists):
+            while positions[list_idx] < len(chunk_list):
+                chunk_idx = chunk_list[positions[list_idx]]
+                positions[list_idx] += 1
+
+                if chunk_idx in seen:
+                    continue
+
+                merged.append(chunk_idx)
+                seen.add(chunk_idx)
+                added_any = True
+                break
+
+            if len(merged) >= limit:
+                break
+
+        if not added_any:
+            break
+
+    return merged
+
 def get_answer(
     question: str,
     cfg: RAGConfig,
@@ -114,10 +229,14 @@ def get_answer(
     sources = artifacts["sources"]
     retrievers = artifacts["retrievers"]
     ranker = artifacts["ranker"]
-    # Ensure these locals exist for all control flows to avoid UnboundLocalError
+    # Defaults used later by logging / tests.
     ranked_chunks: List[str] = []
+    retrieved_chunks: List[str] = []
+    retrieved_sources: List[str] = []
     topk_idxs: List[int] = []
     scores = []
+    log_scores: List[float] = []
+    log_info = dict(additional_log_info or {})
     
     # Step 1: Get chunks (golden, retrieved, or none)
     chunks_info = None
@@ -130,39 +249,73 @@ def get_answer(
         ranked_chunks = []
     elif cfg.use_indexed_chunks:
         ranked_chunks, topk_idxs = use_indexed_chunks(question, chunks)
+        retrieved_chunks = ranked_chunks[:]
+        retrieved_sources = [sources[i] for i in topk_idxs if 0 <= i < len(sources)]
+        log_scores = [0.0] * len(topk_idxs)
     else:
-        retrieval_query = question
-        # print(f"Retrieval query: {retrieval_query}")
-        if cfg.use_hyde:
-            retrieval_query = generate_hypothetical_document(question, cfg.gen_model, max_tokens=cfg.hyde_max_tokens)
-        
-        pool_n = max(cfg.num_candidates, cfg.top_k + 10)
-        raw_scores: Dict[str, Dict[int, float]] = {}
-        for retriever in retrievers:
-            # print(f"Getting scores from retriever: {retriever.name}...")
-            raw_scores[retriever.name] = retriever.get_scores(retrieval_query, pool_n, chunks)
-        # TODO: Fix retrieval logging.
+        retrieval_queries = build_retrieval_queries(question, cfg)
+        retrieval_runs = []
+        sub_query_ranker = build_sub_query_ranker(cfg, retrievers, ranker)
 
-        # print("Raw scores from retrievers:")
-        # for retriever_name, score_dict in raw_scores.items():
-        #     print(f"  {retriever_name}: {list(score_dict.values())}")
-        # Step 2: Ranking
-        ordered, scores = ranker.rank(raw_scores=raw_scores)
-        # print(f"Ordered candidate indices after ranking: {ordered[:cfg.top_k]}")
-        # print(f"Corresponding scores: {scores[:cfg.top_k]}")
-        topk_idxs = filter_retrieved_chunks(cfg, chunks, ordered)
-        ranked_chunks = [chunks[i] for i in topk_idxs]
-        # print(f"Top-{cfg.top_k} chunk indices after filtering: {topk_idxs}")
-        # print("Len Ranked chunks:", len(ranked_chunks))
-        # print("Example ranked chunk content:", ranked_chunks[0] if ranked_chunks else "No chunks retrieved")
+        for query_idx, retrieval_question in enumerate(retrieval_queries):
+            current_ranker = ranker if query_idx == 0 else sub_query_ranker
+            query_topk, query_scores, raw_scores, actual_retrieval_query = retrieve_chunks_for_query(
+                retrieval_question,
+                cfg,
+                retrievers,
+                current_ranker,
+                chunks,
+            )
+            retrieval_runs.append({
+                "question": retrieval_question,
+                "retrieval_query": actual_retrieval_query,
+                "topk_idxs": query_topk,
+                "scores": query_scores[:len(query_topk)],
+                "raw_scores": raw_scores,
+            })
+
+        if len(retrieval_runs) == 1:
+            topk_idxs = retrieval_runs[0]["topk_idxs"]
+            scores = retrieval_runs[0]["scores"]
+            raw_scores = retrieval_runs[0]["raw_scores"]
+            log_scores = scores[:]
+            hyde_query = retrieval_runs[0]["retrieval_query"] if cfg.use_hyde else None
+        else:
+            chunk_lists = [run["topk_idxs"] for run in retrieval_runs]
+            topk_idxs = merge_chunk_lists(chunk_lists, cfg.top_k)
+            scores = []
+            raw_scores = {}
+
+            # Keep one score per chunk for logging after merging.
+            best_score_by_chunk = {}
+            for run in retrieval_runs:
+                for idx, score in zip(run["topk_idxs"], run["scores"]):
+                    if idx not in best_score_by_chunk or score > best_score_by_chunk[idx]:
+                        best_score_by_chunk[idx] = score
+
+            log_scores = [best_score_by_chunk.get(idx, 0.0) for idx in topk_idxs]
+            log_info["used_query_decomposition"] = True
+            log_info["target_sub_question_count"] = len(retrieval_queries) - 1
+            log_info["retrieval_queries"] = retrieval_queries
+            log_info["sub_query_ranker_weights"] = getattr(sub_query_ranker, "weights", {})
+            log_info["sub_query_results"] = [
+                {
+                    "question": run["question"],
+                    "top_idxs": run["topk_idxs"],
+                }
+                for run in retrieval_runs
+            ]
+
+        retrieved_chunks = [chunks[i] for i in topk_idxs]
+        retrieved_sources = [sources[i] for i in topk_idxs]
+        ranked_chunks = retrieved_chunks[:]
         
         
-        # Capture chunk info if in test mode
+        # Save extra retrieval details for benchmark mode.
         if is_test_mode:
-            # Compute individual ranker ranks
-            faiss_scores = raw_scores.get("faiss", {})
-            bm25_scores = raw_scores.get("bm25", {})
-            index_scores = raw_scores.get("index_keywords", {})
+            faiss_scores = raw_scores.get("faiss", {}) if raw_scores else {}
+            bm25_scores = raw_scores.get("bm25", {}) if raw_scores else {}
+            index_scores = raw_scores.get("index_keywords", {}) if raw_scores else {}
             
             faiss_ranked = sorted(faiss_scores.keys(), key=lambda i: faiss_scores[i], reverse=True)
             bm25_ranked = sorted(bm25_scores.keys(), key=lambda i: bm25_scores[i], reverse=True)
@@ -236,18 +389,18 @@ def get_answer(
         logger.save_chat_log(
             query=question,
             config_state=cfg.get_config_state(),
-            ordered_scores=scores[:len(topk_idxs)] if 'scores' in locals() else [],
+            ordered_scores=log_scores,
             chat_request_params={
                 "system_prompt": system_prompt,
                 "max_tokens": cfg.max_gen_tokens
             },
             top_idxs=topk_idxs,
-            chunks=chunks,
-            sources=sources,
+            chunks=retrieved_chunks,
+            sources=retrieved_sources,
             page_map=page_nums,
             full_response=ans,
             top_k=len(topk_idxs),
-            additional_log_info=additional_log_info
+            additional_log_info=log_info
         )
         return ans
 
@@ -299,12 +452,12 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
         sys.exit(1)
 
     chat_history = []
-    additional_log_info = {}
     print("Initialization complete. You can start asking questions!")
     print("Type 'exit' or 'quit' to end the session.")
     while True:
         print("CHAT HISTORY:", chat_history)  # Debug print to trace chat history
         try:
+            additional_log_info = {}
             q = input("\nAsk > ").strip()
             if not q:
                 continue

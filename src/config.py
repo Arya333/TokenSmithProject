@@ -44,6 +44,8 @@ class RAGConfig:
     use_hyde: bool = False
     hyde_max_tokens: int = 300
     use_double_prompt: bool = False
+    use_query_decomposition: bool = False
+    max_sub_questions: int = 4
 
     # conversational memory
     enable_history: bool = True

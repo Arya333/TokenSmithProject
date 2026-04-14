@@ -3,7 +3,6 @@ Query enhancement techniques for improved retrieval (use only one):
 - HyDE (Hypothetical Document Embeddings): Generate hypothetical answer for better retrieval
 - Query Enrichment: LLM-based query expansion
 """
-
 import textwrap
 from typing import Optional
 from src.generator import ANSWER_END, ANSWER_START, run_llama_cpp, text_cleaning
@@ -129,17 +128,25 @@ def expand_query_with_keywords(
 def decompose_complex_query(
     query: str,
     model_path: str,
+    max_sub_questions: int = 4,
     **llm_kwargs
 ) -> list[str]:
-    """
-    Breaks a complex multi-part question into sub-questions.
-    Useful for tasks where a single retrieval might miss some parts of the answer.
-    """
+    """Split a multi-part question into smaller questions."""
     prompt = textwrap.dedent(f"""\
         <|im_start|>system
-        Break the following complex question into simple, single-step sub-questions.
-        If the question is already simple, just output the original question.
-        Output each sub-question on a new line. Do not provide explanations.
+        Rewrite one database question into smaller standalone questions.
+
+        Rules:
+        - Return only the rewritten questions.
+        - Put one question on each line.
+        - Every line must end with ?.
+        - Do not write labels, numbering, bullets, explanations, or quotes.
+        - Do not write words like "Output" or "Answer".
+        - Keep important database terms exactly as written.
+        - Keep shared context in each line if it matters.
+        - Cover the main parts of the original question.
+        - Write at most {max_sub_questions} lines.
+        - If the question is already simple, return it unchanged.
         <|im_end|>
         <|im_start|>user
         Complex Question: {query}
@@ -156,10 +163,24 @@ def decompose_complex_query(
         **llm_kwargs
     )
 
-    sub_questions = [line.strip() for line in output["choices"][0]["text"].split('\n') if line.strip()]
+    # Split on ? because the local model sometimes puts multiple questions on one line.
+    raw_text = output["choices"][0]["text"].replace("\r", " ").replace("\n", " ").strip()
+    parts = raw_text.split("?")
 
-    # Remove numbering if present
-    sub_questions = [line.split('.', 1)[-1].strip() if '.' in line[:3] else line for line in sub_questions]
+    sub_questions = []
+    for part in parts:
+        cleaned = " ".join(part.split()).strip()
+        if not cleaned:
+            continue
+        if cleaned.lower().startswith("output:"):
+            cleaned = cleaned[len("output:"):].strip()
+        if cleaned.lower().startswith("output"):
+            cleaned = cleaned[len("output"):].strip(" :")
+        if not cleaned:
+            continue
+        sub_questions.append(f"{cleaned}?")
+        if len(sub_questions) >= max_sub_questions:
+            break
 
     return sub_questions
 
