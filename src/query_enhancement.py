@@ -4,8 +4,58 @@ Query enhancement techniques for improved retrieval (use only one):
 - Query Enrichment: LLM-based query expansion
 """
 import textwrap
+import re
 from typing import Optional
 from src.generator import ANSWER_END, ANSWER_START, run_llama_cpp, text_cleaning
+
+
+_LEADING_SUBQUERY_JUNK = "\ufeff\u200b\u00bf\u00a1\"'`[](){}.,;:!?-_* "
+_GENERATED_QUERY_LABEL_RE = re.compile(
+    r"\b(?:output|answer|question|standalone question|rewritten query|rewritten question)\s*:\s*",
+    re.IGNORECASE,
+)
+
+
+def clean_generated_query(text: str, fallback: Optional[str] = None) -> str:
+    """Clean labels and accidental prompt echoes from an LLM-generated query."""
+    cleaned = " ".join(str(text).split()).strip()
+    cleaned = cleaned.replace("\u00c2\u00bf", "").strip()
+
+    label_matches = list(_GENERATED_QUERY_LABEL_RE.finditer(cleaned))
+    if label_matches:
+        candidate = cleaned[label_matches[-1].end():].strip()
+        if candidate:
+            cleaned = candidate
+
+    while True:
+        stripped = _GENERATED_QUERY_LABEL_RE.sub("", cleaned, count=1).strip()
+        if stripped == cleaned:
+            break
+        cleaned = stripped
+
+    cleaned = cleaned.lstrip(_LEADING_SUBQUERY_JUNK).strip()
+    if not cleaned and fallback is not None:
+        return fallback
+
+    if fallback is not None and len(cleaned) > max(len(fallback) * 2, len(fallback) + 80):
+        return fallback
+
+    return cleaned
+
+
+def _clean_decomposed_question(text: str) -> str:
+    """Normalize one LLM-generated sub-question."""
+    cleaned = " ".join(text.split()).strip()
+    cleaned = cleaned.replace("\u00c2\u00bf", "").strip()
+    cleaned = cleaned.lstrip(_LEADING_SUBQUERY_JUNK)
+    cleaned = re.sub(r"^\d+\s*[\).\:-]\s*", "", cleaned).strip()
+
+    for prefix in ("output:", "output"):
+        if cleaned.lower().startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip(" :")
+
+    cleaned = cleaned.lstrip(_LEADING_SUBQUERY_JUNK)
+    return cleaned
 
 
 def generate_hypothetical_document(
@@ -143,7 +193,8 @@ def decompose_complex_query(
         - Do not write labels, numbering, bullets, explanations, or quotes.
         - Do not write words like "Output" or "Answer".
         - Keep important database terms exactly as written.
-        - Keep shared context in each line if it matters.
+        - Preserve necessary topic qualifiers in every line, such as "under snapshot isolation", "in SQL", or "for B+ trees".
+        - Do not make vague subquestions that only make sense if another generated line is read first.
         - Cover the main parts of the original question.
         - Write at most {max_sub_questions} lines.
         - If the question is already simple, return it unchanged.
@@ -169,13 +220,7 @@ def decompose_complex_query(
 
     sub_questions = []
     for part in parts:
-        cleaned = " ".join(part.split()).strip()
-        if not cleaned:
-            continue
-        if cleaned.lower().startswith("output:"):
-            cleaned = cleaned[len("output:"):].strip()
-        if cleaned.lower().startswith("output"):
-            cleaned = cleaned[len("output"):].strip(" :")
+        cleaned = _clean_decomposed_question(part)
         if not cleaned:
             continue
         sub_questions.append(f"{cleaned}?")
@@ -248,10 +293,10 @@ def contextualize_query(
         **llm_kwargs
     )
 
-    rewritten = output["choices"][0]["text"].strip()
-    
+    rewritten = clean_generated_query(output["choices"][0]["text"], fallback=query)
+
     # If model hallucinates or errors, fall back to original query
-    if not rewritten or len(rewritten) > len(query) * 2:
+    if not rewritten or len(rewritten) > max(len(query) * 2, len(query) + 80):
         return query
-        
+
     return rewritten

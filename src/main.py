@@ -24,7 +24,11 @@ from src.query_enhancement import (
     generate_hypothetical_document,
 )
 from src.ranking.ranker import EnsembleRanker
-from src.ranking.reranker import rerank
+from src.retrieval_selection import (
+    merge_retrieval_runs,
+    rerank_chunks_with_ids,
+    rerank_with_query_overlap,
+)
 from src.retriever import (
     BM25Retriever,
     FAISSRetriever,
@@ -48,7 +52,7 @@ def parse_args() -> argparse.Namespace:
         help="use a partial index stored in 'index/partial_sections' instead of 'index/sections'",
     )
     parser.add_argument("--model_path", help="path to generation model")
-    parser.add_argument("--system_prompt_mode", choices=["baseline", "tutor", "concise", "detailed"], default="baseline")
+    parser.add_argument("--system_prompt_mode", choices=["baseline", "tutor", "concise", "detailed"], default=None)
 
     indexing_group = parser.add_argument_group("indexing options")
     indexing_group.add_argument("--keep_tables", action="store_true")
@@ -209,6 +213,7 @@ def retrieve_chunks_for_query(
     retrievers: list,
     ranker: Any,
     chunks: list,
+    candidate_limit: Optional[int] = None,
 ) -> tuple[list[int], list[float], Dict[str, Dict[int, float]], str]:
     """Run retrieval once for one query."""
     retrieval_query = query
@@ -225,36 +230,14 @@ def retrieve_chunks_for_query(
         raw_scores[retriever.name] = retriever.get_scores(retrieval_query, pool_n, chunks)
 
     ordered, scores = ranker.rank(raw_scores=raw_scores)
-    topk_idxs = filter_retrieved_chunks(cfg, chunks, ordered)
+    ordered, scores = rerank_with_query_overlap(query, ordered, scores, chunks)
+
+    if candidate_limit is None:
+        topk_idxs = filter_retrieved_chunks(cfg, chunks, ordered)
+    else:
+        topk_idxs = ordered[:candidate_limit]
+
     return topk_idxs, scores[: len(topk_idxs)], raw_scores, retrieval_query
-
-
-def merge_chunk_lists(chunk_lists: list[list[int]], limit: int) -> list[int]:
-    """Round-robin merge so one query does not fill every slot."""
-    merged = []
-    seen = set()
-    positions = [0] * len(chunk_lists)
-
-    while len(merged) < limit:
-        added_any = False
-        for list_idx, chunk_list in enumerate(chunk_lists):
-            while positions[list_idx] < len(chunk_list):
-                chunk_idx = chunk_list[positions[list_idx]]
-                positions[list_idx] += 1
-                if chunk_idx in seen:
-                    continue
-                merged.append(chunk_idx)
-                seen.add(chunk_idx)
-                added_any = True
-                break
-
-            if len(merged) >= limit:
-                break
-
-        if not added_any:
-            break
-
-    return merged
 
 
 def merge_raw_scores(retrieval_runs: list[dict]) -> Dict[str, Dict[int, float]]:
@@ -322,6 +305,7 @@ def get_answer(
     retrieved_sources: List[str] = []
     topk_idxs: List[int] = []
     log_scores: List[float] = []
+    generator_chunks_info: list[dict] = []
     log_info = dict(additional_log_info or {})
 
     chunks_info = None
@@ -355,6 +339,7 @@ def get_answer(
         retrieval_queries = build_retrieval_queries(question, cfg)
         retrieval_runs = []
         sub_query_ranker = build_sub_query_ranker(cfg, retrievers, ranker)
+        candidate_limit = cfg.top_k if len(retrieval_queries) == 1 else max(cfg.top_k * 2, cfg.top_k + 10)
 
         for query_idx, retrieval_question in enumerate(retrieval_queries):
             current_ranker = ranker if query_idx == 0 else sub_query_ranker
@@ -364,6 +349,7 @@ def get_answer(
                 retrievers,
                 current_ranker,
                 chunks,
+                candidate_limit=candidate_limit,
             )
             retrieval_runs.append(
                 {
@@ -382,19 +368,12 @@ def get_answer(
             raw_scores = run["raw_scores"]
             hyde_query = run["retrieval_query"] if cfg.use_hyde else None
         else:
-            topk_idxs = merge_chunk_lists([run["topk_idxs"] for run in retrieval_runs], cfg.top_k)
+            topk_idxs, log_scores = merge_retrieval_runs(retrieval_runs, chunks, cfg.top_k)
             raw_scores = merge_raw_scores(retrieval_runs)
-
-            best_score_by_chunk = {}
-            for run in retrieval_runs:
-                for idx, score in zip(run["topk_idxs"], run["scores"]):
-                    if idx not in best_score_by_chunk or score > best_score_by_chunk[idx]:
-                        best_score_by_chunk[idx] = score
-
-            log_scores = [best_score_by_chunk.get(idx, 0.0) for idx in topk_idxs]
             log_info["used_query_decomposition"] = True
             log_info["target_sub_question_count"] = len(retrieval_queries) - 1
             log_info["retrieval_queries"] = retrieval_queries
+            log_info["final_selection_strategy"] = "per_subquery_coverage_then_diverse_global_fill"
             log_info["sub_query_ranker_weights"] = getattr(sub_query_ranker, "weights", {})
             log_info["sub_query_results"] = [
                 {
@@ -411,7 +390,16 @@ def get_answer(
         if is_test_mode:
             chunks_info = build_chunks_info(topk_idxs, chunks, raw_scores)
 
-        ranked_chunks = rerank(question, ranked_chunks, mode=cfg.rerank_mode, top_n=cfg.rerank_top_k)
+        ranked_chunks, generator_chunks_info = rerank_chunks_with_ids(
+            question,
+            topk_idxs,
+            chunks,
+            mode=cfg.rerank_mode,
+            top_n=cfg.rerank_top_k,
+            retrieval_runs=retrieval_runs,
+        )
+        if len(retrieval_runs) > 1:
+            log_info["generator_selection_strategy"] = "subquery_coverage_then_global_rerank_fill"
 
     if not ranked_chunks and not cfg.disable_chunks:
         if console:
@@ -446,6 +434,13 @@ def get_answer(
 
         meta = artifacts.get("meta", [])
         page_nums = get_page_numbers(topk_idxs, meta)
+        for chunk_info in generator_chunks_info:
+            idx = chunk_info["idx"]
+            chunk_info["source"] = sources[idx] if 0 <= idx < len(sources) else None
+            chunk_info["page_number"] = page_nums.get(idx, 1)
+
+        log_info["selected_chunk_ids_before_generator_rerank"] = topk_idxs
+        log_info["chunks_sent_to_generator"] = generator_chunks_info
         logger.save_chat_log(
             query=question,
             config_state=cfg.get_config_state(),

@@ -359,6 +359,15 @@ class TestGeneratorAPI:
             prompt = get_system_prompt(mode)
             assert prompt is not None
             assert isinstance(prompt, str)
+
+    def test_tutor_prompt_discourages_invented_examples(self):
+        """Tutor prompt tells the model not to invent unsupported examples."""
+        from src.generator import get_system_prompt
+
+        prompt = get_system_prompt("tutor")
+
+        assert "Do not invent examples" in prompt
+        assert "leave it out rather than guessing" in prompt
     
     def test_text_cleaning(self):
         """text_cleaning removes control characters and dangerous patterns."""
@@ -592,6 +601,57 @@ class TestQueryEnhancementAPI:
         
         assert isinstance(result, list)
 
+    @patch('src.query_enhancement.run_llama_cpp')
+    def test_decompose_complex_query_strips_leading_junk(self, mock_llm):
+        """decompose_complex_query strips numbering and inverted punctuation."""
+        from src.query_enhancement import decompose_complex_query
+
+        mock_llm.return_value = {
+            "choices": [{
+                "text": "1. What snapshot is read?\n2. \u00bfWhat does first-committer-wins mean?"
+            }]
+        }
+
+        result = decompose_complex_query(
+            "Explain snapshot isolation and first-committer-wins",
+            model_path="mock_model"
+        )
+
+        assert result == [
+            "What snapshot is read?",
+            "What does first-committer-wins mean?",
+        ]
+
+    @patch('src.query_enhancement.run_llama_cpp')
+    def test_decompose_prompt_preserves_context(self, mock_llm):
+        """decompose_complex_query asks the model to keep necessary context."""
+        from src.query_enhancement import decompose_complex_query
+
+        mock_llm.return_value = {
+            "choices": [{
+                "text": "What snapshot does a transaction read under snapshot isolation?"
+            }]
+        }
+
+        decompose_complex_query(
+            "Under snapshot isolation, what snapshot does a transaction read?",
+            model_path="mock_model"
+        )
+
+        prompt = mock_llm.call_args.args[0]
+        assert "Preserve necessary topic qualifiers" in prompt
+
+    def test_clean_generated_query_removes_output_echo(self):
+        """clean_generated_query removes labels accidentally emitted by the LLM."""
+        from src.query_enhancement import clean_generated_query
+
+        result = clean_generated_query(
+            "Original query text Output: Under snapshot isolation, what snapshot is read?",
+            fallback="Original query text",
+        )
+
+        assert result == "Under snapshot isolation, what snapshot is read?"
+
 
 # ====================== Load Artifacts Tests ======================
 
@@ -725,6 +785,114 @@ class TestMainEntryPoints:
         assert "what" not in keywords  # stopword
         assert "the" not in keywords   # stopword
         assert "database" in keywords or "transactions" in keywords
+
+    def test_definition_cues_match_target_phrase(self):
+        """Definition scoring prefers chunks that define the requested target."""
+        from src.retrieval_selection import score_definition_cues
+
+        definition_chunk = (
+            "Foreign keys are a form of referential integrity constraint where "
+            "the referenced attributes form a primary key of the referenced relation."
+        )
+        noisy_chunk = (
+            "SQL includes a references privilege that permits a user to declare "
+            "foreign keys when creating relations."
+        )
+
+        assert score_definition_cues("What is a foreign key?", definition_chunk) == 1.0
+        assert score_definition_cues("What is a foreign key?", noisy_chunk) == 0.0
+
+    def test_generator_selection_preserves_subquery_coverage(self):
+        """Generator chunk selection keeps room for decomposed subqueries."""
+        from src.retrieval_selection import rerank_chunks_with_ids
+
+        chunks = [
+            "General overview chunk",
+            "Another global chunk",
+            "Background chunk",
+            "Alpha is a specific definition.",
+            "Beta is another specific definition.",
+        ]
+        retrieval_runs = [
+            {
+                "question": "Explain alpha and beta.",
+                "topk_idxs": [0, 1, 2, 3, 4],
+                "scores": [0.9, 0.8, 0.7, 0.6, 0.5],
+            },
+            {
+                "question": "What is alpha?",
+                "topk_idxs": [3, 0],
+                "scores": [0.95, 0.1],
+            },
+            {
+                "question": "What is beta?",
+                "topk_idxs": [4, 1],
+                "scores": [0.95, 0.1],
+            },
+        ]
+
+        _, sent_chunks = rerank_chunks_with_ids(
+            "Explain alpha and beta.",
+            [0, 1, 2, 3, 4],
+            chunks,
+            mode="",
+            top_n=3,
+            retrieval_runs=retrieval_runs,
+        )
+
+        assert [chunk["idx"] for chunk in sent_chunks] == [3, 4, 0]
+        assert sent_chunks[0]["selection_reason"] == "subquery_coverage"
+        assert sent_chunks[1]["selection_reason"] == "subquery_coverage"
+        assert sent_chunks[2]["selection_reason"] == "global_rerank"
+
+    def test_generator_selection_reuses_existing_coverage(self):
+        """One selected chunk can satisfy more than one subquery."""
+        from src.retrieval_selection import rerank_chunks_with_ids
+
+        chunks = [
+            "Alpha and beta are both explained here.",
+            "Weak beta-only chunk.",
+            "Global filler chunk.",
+        ]
+        retrieval_runs = [
+            {"question": "Explain alpha and beta.", "topk_idxs": [0, 1, 2], "scores": [0.9, 0.8, 0.7]},
+            {"question": "What is alpha?", "topk_idxs": [0], "scores": [0.95]},
+            {"question": "What is beta?", "topk_idxs": [0, 1], "scores": [0.95, 0.5]},
+        ]
+
+        _, sent_chunks = rerank_chunks_with_ids(
+            "Explain alpha and beta.",
+            [0, 1, 2],
+            chunks,
+            mode="",
+            top_n=2,
+            retrieval_runs=retrieval_runs,
+        )
+
+        assert [chunk["idx"] for chunk in sent_chunks] == [0, 1]
+        assert sent_chunks[0]["covered_queries"] == ["What is alpha?", "What is beta?"]
+
+    def test_generator_selection_skips_weak_coverage_chunk(self):
+        """A low final-rerank chunk should not be forced only for coverage."""
+        from src.retrieval_selection import rerank_chunks_with_ids
+
+        chunks = [f"Global chunk {i}" for i in range(7)] + ["Weak forced coverage chunk"]
+        retrieval_runs = [
+            {"question": "Explain alpha and beta.", "topk_idxs": list(range(8)), "scores": [1.0] * 8},
+            {"question": "What is beta?", "topk_idxs": [7], "scores": [0.95]},
+        ]
+
+        _, sent_chunks = rerank_chunks_with_ids(
+            "Explain alpha and beta.",
+            list(range(8)),
+            chunks,
+            mode="",
+            top_n=3,
+            retrieval_runs=retrieval_runs,
+        )
+
+        assert [chunk["idx"] for chunk in sent_chunks] == [0, 1, 2]
+        assert all(chunk["selection_reason"] == "global_rerank" for chunk in sent_chunks)
 
 
 # ====================== Integration-style API Tests ======================

@@ -6,7 +6,8 @@ num_candidates: 50
 ensemble_method: "rrf"
 ranker_weights: {"faiss":1,"bm25":0,"index_keywords":0}
 rrf_k: 60
-max_gen_tokens: 400
+max_gen_tokens: 600
+system_prompt_mode: "tutor"
 chunk_mode: "recursive_sections"
 gen_model: "models/generators/qwen2.5-3b-instruct-q8_0.gguf"
 chunk_size_in_chars: 2000
@@ -23,5 +24,5 @@ semantic_cache_enabled: false
 semantic_cache_bi_encoder_threshold: 0.90
 semantic_cache_cross_encoder_threshold: 0.99
 enable_topic_extraction: false
-use_query_decomposition: true
+use_query_decomposition: false 
 max_sub_questions: 4

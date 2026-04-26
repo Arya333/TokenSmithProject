@@ -37,11 +37,11 @@ class RAGConfig:
     rerank_top_k: int = 5
 
     # generation
-    max_gen_tokens: int = 400
+    max_gen_tokens: int = 700
     gen_model: str = "models/generators/qwen2.5-3b-instruct-q8_0.gguf"
 
     # testing
-    system_prompt_mode: str = "baseline"
+    system_prompt_mode: str = "tutor"
     disable_chunks: bool = False
     use_golden_chunks: bool = False
     output_mode: str = "terminal"
